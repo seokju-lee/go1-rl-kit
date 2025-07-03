@@ -30,6 +30,10 @@ import numpy as np
 import struct
 import torch
 import scipy
+import threading
+import rospy
+from std_msgs.msg import Float32MultiArray, Int32MultiArray
+import signal
 
 from actor_critic import ActorCritic
 sys.path.append('unitree_legged_sdk/lib/python/amd64')
@@ -89,6 +93,23 @@ class Agent():
 
         self.cmd = sdk.LowCmd()
         self.state = sdk.LowState()
+        self.lock = threading.Lock()  # 동기화용 Lock
+        self.path = path
+
+        # ROS 퍼블리셔 초기화
+        rospy.init_node("robot_data_publisher", anonymous=True)
+        # ROS publishers
+        self.base_ang_vel_pub = rospy.Publisher('/base_ang_vel', Float32MultiArray, queue_size=10)
+        self.bms_current_pub = rospy.Publisher('/bms_current', Int32MultiArray, queue_size=10)
+        self.dof_vel_pub = rospy.Publisher('/dof_vel', Float32MultiArray, queue_size=10)
+        self.dof_pos_pub = rospy.Publisher('/dof_pos', Float32MultiArray, queue_size=10)
+        self.dof_tau_pub = rospy.Publisher('/dof_tau', Float32MultiArray, queue_size=10)
+        self.lin_acc_pub = rospy.Publisher('/lin_acc', Float32MultiArray, queue_size=10)
+
+        self.ros_thread = None  # ROS 퍼블리시용 스레드
+        self.state_thread = None  # 상태 업데이트용 스레드
+        self.stop_event = threading.Event()  # 종료 신호를 관리할 Event
+        signal.signal(signal.SIGINT, self.stop)  # SIGINT (Ctrl+C) 처리
         self.udp.InitCmdData(self.cmd)
 
     def get_body_angular_vel(self):
@@ -152,6 +173,11 @@ class Agent():
             self.dof_vel.squeeze(),
             self.actions,
             ),dim=-1)
+        # print("ang vel: ", self.base_ang_vel.squeeze())
+        # print("commands: ", self.commands)
+        # print("dof pos: ", self.dof_pos.squeeze())
+        # print("dof vel: ", self.dof_vel.squeeze())
+        # print("actions: ", self.actions)
         current_obs = self.obs
         
         self.obs = torch.cat((self.obs,self.obs_storage),dim=-1)
@@ -172,10 +198,65 @@ class Agent():
             if self.motiontime > 1100:
                 self.init = False
             self.post_step()
-        print("Starting")
-        while True:
+        print("Starting control loop")
+        while not self.stop_event.is_set():  # 종료 신호 확인
             self.step()
+        print("Exiting control loop")
 
+    def update_state(self):
+        """UDP로부터 self.state를 500Hz로 주기적으로 업데이트"""
+        while True:
+            with self.lock:  # state 업데이트 동기화
+                self.pre_step()  # UDP 데이터 수신 및 업데이트
+            time.sleep(0.002)  # 500Hz
+
+    def start_ros_publisher(self):
+        """500Hz로 ROS 데이터를 퍼블리시"""
+        def _ros_publish_loop():
+            rate = rospy.Rate(500)  # 500Hz
+            while not rospy.is_shutdown():
+                with self.lock:  # state 접근 동기화
+                    if self.state:
+                        # base_ang_vel 퍼블리시
+                        base_ang_vel_msg = Float32MultiArray()
+                        base_ang_vel_msg.data = self.state.imu.gyroscope
+                        bms_current_msg = Int32MultiArray()
+                        bms_current_msg.data = self.state.bms.current
+                        
+                        self.base_ang_vel_pub.publish(base_ang_vel_msg)
+                        self.bms_current_pub.publish(bms_current_msg)
+
+                        # dof_vel 퍼블리시
+                        dof_vel_msg = Float32MultiArray()
+                        dof_vel_msg.data = self.getJointVelocity()
+                        self.dof_vel_pub.publish(dof_vel_msg)
+
+                        # dof_pos 퍼블리시
+                        dof_pos_msg = Float32MultiArray()
+                        dof_pos_msg.data = self.getJointPos()
+                        self.dof_pos_pub.publish(dof_pos_msg)
+
+                        # dof_tau 퍼블리시
+                        dof_tau_msg = Float32MultiArray()
+                        dof_tau_msg.data = self.getJointTorque()
+                        self.dof_tau_pub.publish(dof_tau_msg)
+
+                        # lin_acc 퍼블리시
+                        lin_acc_msg = Float32MultiArray()
+                        lin_acc_msg.data = self.state.imu.accelerometer
+                        self.lin_acc_pub.publish(lin_acc_msg)
+
+                rate.sleep()
+
+        self.ros_thread = threading.Thread(target=_ros_publish_loop)
+        self.ros_thread.daemon = True
+        self.ros_thread.start()
+        
+    def stop(self):
+        """Agent 종료"""
+        print("Stopping Agent...")
+        self.stop_event.set()  # 종료 신호 설정
+        
     def pre_step(self):
         self.udp.Recv()
         self.udp.GetRecv(self.state)
@@ -193,7 +274,8 @@ class Agent():
         actions = torch.clip(self.actions, -100, 100).to('cpu').detach()
         scaled_actions = actions * 0.25
         final_angles = scaled_actions+self.default_angles_tensor
-
+        # final_angles = self.default_angles_tensor
+        # print("actions: ", scaled_actions+self.default_angles_tensor)
         # print("actions:" + ",".join(map(str, actions.numpy().tolist())))
         # print("observations:" + str(time.process_time()) + ",".join(map(str, self.obs.detach().numpy().tolist())))
 
@@ -204,6 +286,8 @@ class Agent():
         '''
         Offers power protection, sends udp packets, maintains timing
         '''
+        if self.stop_event.is_set():  # 종료 신호 확인 후 전송 중지
+            return
         self.safe.PowerProtect(self.cmd, self.state, 9)
         self.udp.SetSend(self.cmd)
         self.udp.Send()
@@ -219,6 +303,13 @@ class Agent():
                 self.state.motorState[self.d['RL_0']].dq,self.state.motorState[self.d['RL_1']].dq,self.state.motorState[self.d['RL_2']].dq,
                 self.state.motorState[self.d['RR_0']].dq,self.state.motorState[self.d['RR_1']].dq,self.state.motorState[self.d['RR_2']].dq]
         return velocity
+    
+    def getJointTorque(self):
+        torque = [self.state.motorState[self.d['FL_0']].tauEst,self.state.motorState[self.d['FL_1']].tauEst,self.state.motorState[self.d['FL_2']].tauEst,
+                self.state.motorState[self.d['FR_0']].tauEst,self.state.motorState[self.d['FR_1']].tauEst,self.state.motorState[self.d['FR_2']].tauEst,
+                self.state.motorState[self.d['RL_0']].tauEst,self.state.motorState[self.d['RL_1']].tauEst,self.state.motorState[self.d['RL_2']].tauEst,
+                self.state.motorState[self.d['RR_0']].tauEst,self.state.motorState[self.d['RR_1']].tauEst,self.state.motorState[self.d['RR_2']].tauEst]
+        return torque
     
     def getJointPos(self):
         current_angles = [

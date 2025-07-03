@@ -30,18 +30,24 @@ import numpy as np
 import struct
 import torch
 import scipy
+import threading
+
+import rospy
+from sensor_msgs.msg import JointState, Imu
+from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Header
 
 from actor_critic import ActorCritic
 sys.path.append('unitree_legged_sdk/lib/python/amd64')
 import robot_interface as sdk
 
-class Agent():
+class Agent2():
     def __init__(self,path):
         self.dt = 0.02
         self.num_actions = 12
-        self.num_obs = 44*5
-        self.unit_obs = 44
-        self.num_privl_obs = 421
+        self.num_obs = 42*5
+        self.unit_obs = 42
+        self.num_privl_obs = 42 * 5 + 6 + 187
         self.device = 'cpu'
         self.path = path#'bp4/model_1750.pt'
         self.d = {'FR_0':0, 'FR_1':1, 'FR_2':2,
@@ -56,7 +62,7 @@ class Agent():
         self.motiontime = 0 
         self.timestep = 0
         self.time = 0
-
+        
 #####################################################################
         self.euler = np.zeros(3)
         self.buf_idx = 0
@@ -112,13 +118,13 @@ class Agent():
         rx = struct.unpack('f', struct.pack('4B', *self.state.wirelessRemote[8:12]))
         # ry = struct.unpack('f', struct.pack('4B', *self.state.wirelessRemote[12:16]))
         forward = ly[0]*0.6  
-        if abs(forward) <0.30:
+        if abs(forward) <0.10:
             forward = 0
         side = -lx[0]*0.5
-        if abs(side) <0.2:
+        if abs(side) <0.1:
             side = 0
         rotate = -rx[0]*0.8
-        if abs(rotate) <0.4:
+        if abs(rotate) <0.1:
             rotate = 0
 
         self.pitch = torch.tensor([self.state.imu.rpy[1]],device=self.device,dtype=torch.float,requires_grad=False)
@@ -127,15 +133,17 @@ class Agent():
         vel = self.getJointVelocity()
 
         self.dof_pos = torch.tensor([m - n for m,n in zip(angles,self.default_angles)],device=self.device,dtype=torch.float,requires_grad=False)
-        body_ang_vel = self.get_body_angular_vel() #self.state.imu.gyroscope  #[state.imu.gyroscope]
+        # body_ang_vel = self.get_body_angular_vel() #self.state.imu.gyroscope  #[state.imu.gyroscope]
+        body_ang_vel = self.state.imu.gyroscope
         # print(vel[1])
         if self.timestep > 1600:
             self.base_ang_vel = torch.tensor([body_ang_vel],device=self.device,dtype=torch.float,requires_grad=False)
             self.dof_vel = torch.tensor([vel],device=self.device,dtype=torch.float,requires_grad=False)
+            # self.dof_pos = torch.tensor([angles], device=self.device, dtype=torch.float, requires_grad=False)
         else:
             self.base_ang_vel = 0*torch.tensor([body_ang_vel],device=self.device,dtype=torch.float,requires_grad=False)
             self.dof_vel = 0*torch.tensor([vel],device=self.device,dtype=torch.float,requires_grad=False)
-
+            # self.dof_pos = self.default_angles_tensor
         if self.timestep > 2000:
             # self.commands = torch.tensor([0.5,0,0],device=self.device,dtype=torch.float,requires_grad=False)
             self.commands = torch.tensor([forward,side,rotate],device=self.device,dtype=torch.float,requires_grad=False)
@@ -145,16 +153,23 @@ class Agent():
 
         self.obs = torch.cat((
             self.base_ang_vel.squeeze(),
-            self.pitch,
-            self.roll,
             self.commands,
-            self.dof_pos,
+            self.dof_pos.squeeze(),
             self.dof_vel.squeeze(),
             self.actions,
             ),dim=-1)
-        current_obs = self.obs
-        
+        current_obs = self.obs.clone()
+        # print("ang vel: ", self.base_ang_vel.squeeze())
+        # print("commands: ", self.commands)
+        # print("dof pos: ", self.dof_pos.squeeze())
+        # print("dof vel: ", self.dof_vel.squeeze())
+        # print("actions: ", self.actions)
         self.obs = torch.cat((self.obs,self.obs_storage),dim=-1)
+
+        # for j in range(5):
+        #     self.obs[self.unit_obs*j+3] = forward
+        #     self.obs[self.unit_obs*j+4] = side
+        #     self.obs[self.unit_obs*j+5] = rotate
 
         self.obs_storage[:-self.unit_obs] = self.obs_storage[self.unit_obs:].clone()
         self.obs_storage[-self.unit_obs:] = current_obs
@@ -192,8 +207,11 @@ class Agent():
         self.actions = self.policy(self.obs)
         actions = torch.clip(self.actions, -100, 100).to('cpu').detach()
         scaled_actions = actions * 0.25
+        # print("final angle: ", scaled_actions+self.default_angles_tensor)
         final_angles = scaled_actions+self.default_angles_tensor
+        # final_angles = self.default_angles_tensor
 
+        # print("actions: ", final_angles)
         # print("actions:" + ",".join(map(str, actions.numpy().tolist())))
         # print("observations:" + str(time.process_time()) + ",".join(map(str, self.obs.detach().numpy().tolist())))
 
@@ -219,6 +237,13 @@ class Agent():
                 self.state.motorState[self.d['RL_0']].dq,self.state.motorState[self.d['RL_1']].dq,self.state.motorState[self.d['RL_2']].dq,
                 self.state.motorState[self.d['RR_0']].dq,self.state.motorState[self.d['RR_1']].dq,self.state.motorState[self.d['RR_2']].dq]
         return velocity
+    
+    def getJointTorque(self):
+        torque = [self.state.motorState[self.d['FL_0']].tauEst,self.state.motorState[self.d['FL_1']].tauEst,self.state.motorState[self.d['FL_2']].tauEst,
+                self.state.motorState[self.d['FR_0']].tauEst,self.state.motorState[self.d['FR_1']].tauEst,self.state.motorState[self.d['FR_2']].tauEst,
+                self.state.motorState[self.d['RL_0']].tauEst,self.state.motorState[self.d['RL_1']].tauEst,self.state.motorState[self.d['RL_2']].tauEst,
+                self.state.motorState[self.d['RR_0']].tauEst,self.state.motorState[self.d['RR_1']].tauEst,self.state.motorState[self.d['RR_2']].tauEst]
+        return torque
     
     def getJointPos(self):
         current_angles = [
@@ -300,3 +325,98 @@ class Agent():
         self.cmd.motorCmd[self.d['RL_2']].Kp = kp
         self.cmd.motorCmd[self.d['RL_2']].Kd = kd
         self.cmd.motorCmd[self.d['RL_2']].tau = 0.0
+
+class ROSAgent2(Agent2):
+    def __init__(self, path):
+        super().__init__(path)
+
+        rospy.init_node("robot_data_publisher", anonymous=True)
+
+        # ROS publishers
+        self.base_ang_vel_pub = rospy.Publisher('/base_ang_vel', Float32MultiArray, queue_size=10)
+        self.dof_vel_pub = rospy.Publisher('/dof_vel', Float32MultiArray, queue_size=10)
+        self.dof_pos_pub = rospy.Publisher('/dof_pos', Float32MultiArray, queue_size=10)
+        self.dof_tau_pub = rospy.Publisher('/dof_tau', Float32MultiArray, queue_size=10)
+        self.lin_acc_pub = rospy.Publisher('/lin_acc', Float32MultiArray, queue_size=10)
+
+        # 데이터 퍼블리시 스레드 종료 플래그
+        self.stop_publish = threading.Event()
+
+        # 데이터 잠금용 Lock
+        self.lock = threading.Lock()
+
+    def publish_ros_data(self):
+        """
+        ROS 데이터 퍼블리시를 500Hz로 수행
+        """
+        rate = rospy.Rate(500)  # 500 Hz
+        while not self.stop_publish.is_set():
+            with self.lock:  # 데이터를 안전하게 읽기 위해 Lock 사용
+                # base_ang_vel 퍼블리시
+                base_ang_vel_msg = Float32MultiArray()
+                base_ang_vel_msg.data = self.state.imu.gyroscope
+                self.base_ang_vel_pub.publish(base_ang_vel_msg)
+
+                # dof_vel 퍼블리시
+                dof_vel_msg = Float32MultiArray()
+                dof_vel_msg.data = self.getJointVelocity()
+                self.dof_vel_pub.publish(dof_vel_msg)
+
+                # dof_pos 퍼블리시
+                dof_pos_msg = Float32MultiArray()
+                dof_pos_msg.data = self.getJointPos()
+                self.dof_pos_pub.publish(dof_pos_msg)
+
+                # dof_tau 퍼블리시
+                dof_tau_msg = Float32MultiArray()
+                dof_tau_msg.data = self.getJointTorque()
+                self.dof_tau_pub.publish(dof_tau_msg)
+
+                # lin_acc 퍼블리시
+                lin_acc_msg = Float32MultiArray()
+                lin_acc_msg.data = self.state.imu.accelerometer
+                self.lin_acc_pub.publish(lin_acc_msg)
+
+            rate.sleep()
+
+    def start_publishing_thread(self):
+        """
+        데이터 퍼블리시 스레드를 시작
+        """
+        self.publish_thread = threading.Thread(target=self.publish_ros_data)
+        self.publish_thread.start()
+
+    def stop_publishing_thread(self):
+        """
+        데이터 퍼블리시 스레드를 종료
+        """
+        self.stop_publish.set()
+        self.publish_thread.join()
+
+    def init_pose(self):
+        """
+        기존 제어 루프: 50Hz로 실행
+        """
+        # 퍼블리시 스레드 시작
+        self.start_publishing_thread()
+
+        while self.init:
+            with self.lock:  # 데이터를 안전하게 처리하기 위해 Lock 사용
+                self.pre_step()
+                self.get_observations()
+            self.motiontime += 1
+            if self.motiontime < 100:
+                self.setJointValues(self.default_angles, kp=5, kd=1)
+            else:
+                self.setJointValues(self.default_angles, kp=50, kd=5)
+            if self.motiontime > 1100:
+                self.init = False
+            self.post_step()
+
+        print("Starting")
+        while not rospy.is_shutdown():  # ROS 종료 신호가 들어오면 종료
+            with self.lock:
+                self.step()
+
+        # 퍼블리시 스레드 종료
+        self.stop_publishing_thread()
